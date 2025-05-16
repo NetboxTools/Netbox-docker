@@ -1,0 +1,104 @@
+trigger: 
+- main
+
+variables: 
+  - template: 'pipelines/prod.yaml'
+stages:
+  - stage: build
+    pool:
+      name: myAgentPool 
+      demands: 
+      - ImageOverride -equals ubuntu-22.04
+    displayName: 'Build'
+    jobs:
+    - deployment: 'build'
+      displayName: 'Build'
+      environment: 'build' 
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+              fetchDepth: 0
+              persistCredentials: true
+            - pwsh: | 
+                az bicep build --file "main.bicep"
+              displayName: 'Bicep Linter & Build'
+            - task: AzurePowerShell@5
+              displayName: 'Netbox'
+              inputs:
+                azureSubscription: '${{ variables.serviceConnection }}' # string. Alias: ConnectedServiceNameARM. Required. Azure Subscription. 
+                ScriptType: 'InlineScript' # 'FilePath' | 'InlineScript'. Script Type. Default: FilePath.
+                pwsh: true # boolean. Use PowerShell Core. Default: false.,
+                azurePowerShellVersion: 'OtherVersion'
+                preferredAzurePowerShellVersion: '11.4.0'
+                Inline: | 
+                  Connect-AzContainerRegistry -Name '${{ variables.AzContainerRegistry }}'
+                  $datenow = Get-date -format yyyyMMdd.hh.mm
+                  Write-Host "##vso[build.updatebuildnumber]$datenow"
+                  write-verbose "Building dockerfile." -verbose
+                  try {
+                    docker build . -t "${{ variables.AzContainerRegistry }}.azurecr.io/Contoso/netbox:$datenow"
+                    docker push "${{ variables.AzContainerRegistry }}.azurecr.io/Contoso/netbox:$datenow"
+                  } catch {
+                    throw
+                  }
+            - task: AzurePowerShell@5
+              displayName: 'Redis'
+              inputs:
+                azureSubscription: '${{ variables.serviceConnection }}' # string. Alias: ConnectedServiceNameARM. Required. Azure Subscription. 
+                ScriptType: 'InlineScript' # 'FilePath' | 'InlineScript'. Script Type. Default: FilePath.
+                pwsh: true # boolean. Use PowerShell Core. Default: false.,
+                azurePowerShellVersion: 'OtherVersion'
+                preferredAzurePowerShellVersion: '11.4.0'
+                Inline: | 
+                  Connect-AzContainerRegistry -Name '${{ variables.AzContainerRegistry }}'
+                  Remove-item Dockerfile -force
+                  Rename-item RedisDockerfile -NewName Dockerfile
+                  docker build . -t "${{ variables.AzContainerRegistry }}.azurecr.io/Contoso/redis:7-alpine"
+                  docker push "${{ variables.AzContainerRegistry }}.azurecr.io/Contoso/redis:7-alpine"
+  - stage: whatif
+    dependsOn: 'build'
+    pool:
+      name: myAgentPool 
+      demands: 
+      - ImageOverride -equals ubuntu-22.04
+    displayName: 'Whatif - Netbox'
+    variables:
+      - template: 'pipelines/prod.yaml'
+      - name: Environment
+        value: 'prod'
+    jobs:
+    - template: 'pipelines/validateDeployment.yml'
+      parameters:
+        AzureSubscription: '${{ variables.AzureSubscription }}'
+        Environment: '${{ variables.Environment }}'
+        ResourceGroupName: ${{ variables.ResourceGroupName }}
+        serviceConnection: '${{ variables.serviceConnection }}'
+        ImageVersion: '$(Build.BuildNumber)'
+  - stage: deploy
+    dependsOn: 'whatif'
+    pool:
+      name: myAgentPool 
+      demands: 
+      - ImageOverride -equals ubuntu-22.04
+    displayName: 'Deployment - Netbox'
+    variables:
+      - template: 'pipelines/prod.yaml'
+      - name: Environment
+        value: 'prod'
+    jobs:
+    - deployment: 'Netbox'
+      displayName: 'Deployment for Netbox'
+      environment: 'prod' 
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - template: 'pipelines/deploy.yml'
+              parameters:
+                AzureSubscription: '${{ variables.AzureSubscription }}'
+                Environment: '${{ variables.Environment }}'
+                ResourceGroupName: ${{ variables.ResourceGroupName }}
+                serviceConnection: '${{ variables.serviceConnection }}'
+                ImageVersion: '$(Build.BuildNumber)'
