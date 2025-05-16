@@ -1,0 +1,38 @@
+parameters: 
+- name: AzureSubscription
+  type: string
+- name: serviceConnection
+  type: string
+- name: Environment
+  type: string
+- name: ResourceGroupName
+  type: string
+- name: ImageVersion
+  type: string
+
+steps: 
+  - checkout: self
+    fetchDepth: 0
+    persistCredentials: true
+  - task: AzurePowerShell@5
+    displayName: 'Deployment for ${{ parameters.Environment }}'
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }} # string. Alias: ConnectedServiceNameARM. Required. Azure Subscription. 
+      ScriptType: 'InlineScript' # 'FilePath' | 'InlineScript'. Script Type. Default: FilePath.
+      pwsh: true # boolean. Use PowerShell Core. Default: false.,
+      azurePowerShellVersion: 'OtherVersion'
+      preferredAzurePowerShellVersion: '11.4.0'
+      Inline: | 
+        Write-verbose "Selecting the subscription '${{ parameters.AzureSubscription }}'" -Verbose
+        Select-AzSubscription -Subscription '${{ parameters.AzureSubscription }}'
+        $now = get-date -Format 'yyyyMMdd-hhmm'
+        Write-verbose "Setting timestamp to '$now'" -verbose
+        Write-verbose "Deploying.." -verbose
+        $params = @{
+          netboxContainerVersion = '${{ parameters.ImageVersion }}'
+          ResourceGroupName = '${{ parameters.ResourceGroupName }}'
+          TemplateParameterFile = 'environments/${{ parameters.Environment }}.bicepparam'
+          name = "${{ parameters.Environment }}-$now"
+          Mode = 'Incremental'
+        }
+        New-AzResourceGroupDeployment @params
