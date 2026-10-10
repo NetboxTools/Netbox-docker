@@ -1,0 +1,160 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  # While a run is in progress, further merges are batched into one run afterwards
+  batch: true
+  branches:
+    include:
+      - main
+
+pr: none
+
+variables:
+  - template: variables/prod.yml
+  - name: foundationDeploymentName
+    value: 'netbox-foundation'
+
+pool:
+  vmImage: 'ubuntu-24.04'
+
+# Stages that use the netbox-prod environment wait for its exclusive lock (configured on the
+# environment) instead of running two ARM deployments against the resource group at once
+lockBehavior: sequential
+
+stages:
+  - stage: foundation
+    displayName: 'Foundation'
+    jobs:
+      - deployment: foundation
+        displayName: 'Registry, Key Vault, identity and Container Apps environment'
+        environment: 'netbox-prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                  - checkout: self
+                  - task: AzureCLI@2
+                    displayName: 'Deploy foundation'
+                    inputs:
+                      azureSubscription: '$(serviceConnection)'
+                      scriptType: 'pscore'
+                      scriptLocation: 'inlineScript'
+                      inlineScript: |
+                        $ErrorActionPreference = 'Stop'
+                        $PSNativeCommandUseErrorActionPreference = $true
+                        az group create --name '$(resourceGroupName)' --location '$(location)' --tags service=netbox environment=prod --output none
+                        az deployment group create `
+                          --resource-group '$(resourceGroupName)' `
+                          --name '$(foundationDeploymentName)' `
+                          --parameters 'infra/environments/foundation.prod.bicepparam' `
+                          --output none
+                  - task: AzureCLI@2
+                    displayName: 'Seed secrets'
+                    inputs:
+                      azureSubscription: '$(serviceConnection)'
+                      scriptType: 'pscore'
+                      scriptLocation: 'inlineScript'
+                      inlineScript: |
+                        $ErrorActionPreference = 'Stop'
+                        $outputs = az deployment group show -g '$(resourceGroupName)' -n '$(foundationDeploymentName)' --query properties.outputs -o json | ConvertFrom-Json
+                        ./scripts/Initialize-NetboxSecrets.ps1 -KeyVaultName $outputs.keyVaultName.value
+
+  - stage: build
+    displayName: 'Build images'
+    dependsOn: foundation
+    jobs:
+      - job: build
+        displayName: 'Build and push'
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: 'Build netbox (if changed), import redis (if new)'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = 'Stop'
+                $PSNativeCommandUseErrorActionPreference = $true
+                $outputs = az deployment group show -g '$(resourceGroupName)' -n '$(foundationDeploymentName)' --query properties.outputs -o json | ConvertFrom-Json
+                $registry = $outputs.containerRegistryName.value
+                $loginServer = $outputs.containerRegistryLoginServer.value
+
+                function Get-Tags([string] $Repository) {
+                    # show-tags fails while the repository doesn't exist yet
+                    $PSNativeCommandUseErrorActionPreference = $false
+                    $tags = @(az acr repository show-tags --name $registry --repository $Repository -o tsv 2>$null)
+                    $PSNativeCommandUseErrorActionPreference = $true
+                    $tags
+                }
+
+                $tag = ./scripts/Get-NetboxImageTag.ps1 -BaseImage '$(netboxBaseImage)'
+                if ((Get-Tags 'netbox') -contains $tag) {
+                    Write-Host "netbox:$tag already exists, nothing to build."
+                }
+                else {
+                    Write-Host "Building netbox:$tag"
+                    az acr login --name $registry
+                    docker build . --pull --build-arg NETBOX_IMAGE='$(netboxBaseImage)' -t "$loginServer/netbox:$tag"
+                    docker push "$loginServer/netbox:$tag"
+                }
+
+                $redisRepository, $redisTag = '$(redisImage)' -split ':', 2
+                if ((Get-Tags $redisRepository) -contains $redisTag) {
+                    Write-Host "$(redisImage) already imported."
+                }
+                else {
+                    az acr import --name $registry --source 'docker.io/library/$(redisImage)' --image '$(redisImage)'
+                }
+
+  - ${{ if ne(variables.entraClientId, '') }}:
+      - stage: whatif
+        displayName: 'What-if'
+        dependsOn: build
+        jobs:
+          - job: whatif
+            displayName: 'What-if NetBox'
+            steps:
+              - checkout: self
+              - task: AzureCLI@2
+                displayName: 'What-if'
+                inputs:
+                  azureSubscription: '$(serviceConnection)'
+                  scriptType: 'pscore'
+                  scriptLocation: 'scriptPath'
+                  scriptPath: 'scripts/Deploy-Netbox.ps1'
+                  arguments: >-
+                    -ResourceGroupName '$(resourceGroupName)'
+                    -FoundationDeploymentName '$(foundationDeploymentName)'
+                    -BaseImage '$(netboxBaseImage)'
+                    -RedisImage '$(redisImage)'
+                    -EntraClientId '$(entraClientId)'
+                    -InitialSuperuserUpn '$(initialSuperuserUpn)'
+                    -WhatIf
+
+      - stage: deploy
+        displayName: 'Deploy'
+        dependsOn: whatif
+        jobs:
+          - deployment: netbox
+            displayName: 'Deploy NetBox'
+            environment: 'netbox-prod'
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - task: AzureCLI@2
+                      displayName: 'Deploy'
+                      inputs:
+                        azureSubscription: '$(serviceConnection)'
+                        scriptType: 'pscore'
+                        scriptLocation: 'scriptPath'
+                        scriptPath: 'scripts/Deploy-Netbox.ps1'
+                        arguments: >-
+                          -ResourceGroupName '$(resourceGroupName)'
+                          -FoundationDeploymentName '$(foundationDeploymentName)'
+                          -BaseImage '$(netboxBaseImage)'
+                          -RedisImage '$(redisImage)'
+                          -EntraClientId '$(entraClientId)'
+                          -InitialSuperuserUpn '$(initialSuperuserUpn)'
