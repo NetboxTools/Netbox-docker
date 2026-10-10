@@ -2,10 +2,9 @@
 .SYNOPSIS
     Seeds the generated NetBox secrets into Key Vault. Existing secrets are never overwritten.
 .DESCRIPTION
-    Runs in the pipeline after foundation.bicep. The pipeline identity needs Key Vault secret data
-    access on the resource group (Key Vault Secrets Officer, granted once before the first run, see
-    README). New vaults and role changes can take a few minutes to become usable, so the first
-    access is retried.
+    Runs in the pipeline after foundation.bicep, which gives the pipeline identity Key Vault Secrets
+    Officer on the vault. New vaults and role assignments can take a few minutes to become usable, so
+    the first access is retried.
 #>
 [CmdletBinding()]
 param(
@@ -62,5 +61,5 @@ foreach ($name in $secrets.Keys) {
 }
 
 if ($existing -notcontains 'entra-client-secret') {
-    Write-Warning "Secret 'entra-client-secret' is missing. Run scripts/New-NetboxLoginApp.ps1 before deploying the application."
+    Write-Warning "Secret 'entra-client-secret' is missing. Run scripts/Set-NetboxLoginAccess.ps1 before NetBox can be deployed."
 }

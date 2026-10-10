@@ -15,7 +15,7 @@ param identityName string
 @description('Tag of the netbox image in the container registry.')
 param netboxImageTag string
 
-@description('Client ID of the Entra app registration used to sign users in (scripts/New-NetboxLoginApp.ps1).')
+@description('Client ID of the Entra app registration used to sign users in (clientId output of infra/entra.bicep, passed by scripts/Deploy-Netbox.ps1).')
 param entraClientId string
 
 @description('UPN of the first NetBox superuser. Must match the Entra sign-in name exactly. Empty = no superuser is created.')

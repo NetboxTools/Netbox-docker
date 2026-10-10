@@ -6,6 +6,10 @@
     the app. So a deployment that adds a host name adds it unbound and creates its certificate; this
     script then waits for the certificate to be issued and deploys a second time to bind it.
 
+    The Entra client ID comes from the netbox-entra deployment (infra/entra.bicep). Until someone has
+    stored the client secret with scripts/Set-NetboxLoginAccess.ps1, the script skips the deployment
+    with a warning instead of failing, so the first pipeline run stays green.
+
     With redisMode 'managed', the Redis access key is only written to Key Vault when it differs from
     the stored one, so routine runs don't add secret versions.
 #>
@@ -14,9 +18,9 @@ param(
     [Parameter(Mandatory)] [string] $ResourceGroupName,
     [Parameter(Mandatory)] [string] $BaseImage,
     [Parameter(Mandatory)] [string] $RedisImage,
-    [Parameter(Mandatory)] [string] $EntraClientId,
     [string] $InitialSuperuserUpn = '',
     [string] $FoundationDeploymentName = 'netbox-foundation',
+    [string] $EntraDeploymentName = 'netbox-entra',
     [string] $ParameterFile = 'infra/environments/prod.bicepparam',
     [switch] $WhatIf
 )
@@ -31,24 +35,13 @@ Write-Host "Image tag: netbox:$ImageTag"
 
 $outputs = az deployment group show -g $ResourceGroupName -n $FoundationDeploymentName --query properties.outputs -o json | ConvertFrom-Json
 
-$identityPrincipalId = $outputs.identityPrincipalId.value
-$requiredRoles = @(
-    @{ Role = 'AcrPull'; Scope = $outputs.containerRegistryId.value }
-    @{ Role = 'Key Vault Secrets User'; Scope = $outputs.keyVaultId.value }
-)
-foreach ($required in $requiredRoles) {
-    # Filter on principalId locally: --assignee triggers a Graph lookup the pipeline identity isn't allowed to make.
-    # --include-inherited so an assignment on the resource group or subscription also counts.
-    $assigned = @(az role assignment list --role $required.Role --scope $required.Scope --include-inherited -o json | ConvertFrom-Json |
-        Where-Object principalId -eq $identityPrincipalId)
-    if ($assigned.Count -eq 0) {
-        throw "The NetBox identity is missing '$($required.Role)' on $(Split-Path $required.Scope -Leaf). Run scripts/Grant-NetboxAccess.ps1 once as an RBAC administrator."
-    }
-}
+$EntraClientId = az deployment group show -g $ResourceGroupName -n $EntraDeploymentName --query properties.outputs.clientId.value -o tsv
 
 $secretNames = @(az keyvault secret list --vault-name $outputs.keyVaultName.value --query '[].name' -o tsv)
 if ($secretNames -notcontains 'entra-client-secret') {
-    throw "Secret 'entra-client-secret' is missing from Key Vault. Run scripts/New-NetboxLoginApp.ps1 first."
+    Write-Warning "Skipping: no 'entra-client-secret' in Key Vault yet. Run scripts/Set-NetboxLoginAccess.ps1 (see README), then run the pipeline again."
+    if ($env:TF_BUILD) { Write-Host '##vso[task.complete result=SucceededWithIssues;]Waiting for the Entra client secret' }
+    return
 }
 
 $subscriptionId = az account show --query id -o tsv

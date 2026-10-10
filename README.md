@@ -54,6 +54,7 @@ Managed Redis (see [Redis: sidecar or managed](#redis-sidecar-or-managed)).
 | Container registry `crnetbox*` | The NetBox image built from this repo, plus the official Redis image (`redisImage`, pinned) imported from Docker Hub |
 | Managed certificates `mc-*` | One per custom domain, issued and renewed by Container Apps |
 | Managed identity `id-netbox` | Pulls images and reads secrets. It is user-assigned, so its role assignments can exist before the app's first revision starts |
+| Entra app `app-netbox-prod-login` | Sign-in app with the app roles `netbox-admins`, `netbox-editors` and `netbox-readers`, managed by `infra/entra.bicep` |
 
 ### How NetBox is configured
 
@@ -78,20 +79,22 @@ ID in front of it. For a private setup, see [Improvements](#improvements--roadma
 ## Repository layout
 
 ```
-Dockerfile                            NetBox image: upstream image + app/netbox_easyauth.py (extend here for plugins)
-app/netbox_easyauth.py                maps Entra app roles from the sign-in header to NetBox groups
-infra/foundation.bicep                registry, Key Vault, identity, Container Apps environment, Log Analytics
-infra/main.bicep                      PostgreSQL, container app, Entra authentication
-infra/modules/postgres.bicep          PostgreSQL Flexible Server + database
-infra/modules/managed-redis.bicep     Azure Managed Redis + access key in Key Vault (redisMode = 'managed')
-infra/environments/*.bicepparam       per-environment parameters
-pipelines/azure-pipelines.yml         Foundation -> Build -> What-if -> Deploy
-pipelines/variables/prod.yml          service connection, resource group, Entra client ID, ...
-scripts/Initialize-NetboxSecrets.ps1  generates the secrets into Key Vault (runs in the pipeline)
-scripts/Grant-NetboxAccess.ps1        one-time role assignments (run once by an RBAC administrator)
-scripts/New-NetboxLoginApp.ps1        creates the Entra sign-in app and its roles (run once by you)
-scripts/Deploy-Netbox.ps1             deploys or what-ifs main.bicep (used by the pipeline)
-scripts/Get-NetboxImageTag.ps1        content-hash image tag (used by the pipeline)
+Dockerfile                             NetBox image: upstream image + app/netbox_easyauth.py (extend here for plugins)
+app/netbox_easyauth.py                 maps Entra app roles from the sign-in header to NetBox groups
+infra/foundation.bicep                 registry, Key Vault, identity, Container Apps environment, Log Analytics, role assignments
+infra/entra.bicep                      Entra sign-in app and its roles (Microsoft Graph Bicep)
+infra/main.bicep                       PostgreSQL, container app, Entra authentication
+infra/modules/postgres.bicep           PostgreSQL Flexible Server + database
+infra/modules/managed-redis.bicep      Azure Managed Redis + access key in Key Vault (redisMode = 'managed')
+infra/environments/*.bicepparam        per-environment parameters
+pipelines/azure-pipelines.yml          Foundation -> Build -> What-if -> Deploy
+pipelines/variables/prod.yml           service connection, resource group, images, first superuser
+scripts/Initialize-PipelineAccess.ps1  one-time: what the pipeline identity may do (run once by an Owner)
+scripts/Set-NetboxLoginAccess.ps1      assigns groups to app roles, stores the client secret (run by you)
+scripts/Initialize-NetboxSecrets.ps1   generates the secrets into Key Vault (pipeline)
+scripts/Deploy-NetboxEntra.ps1         deploys entra.bicep (pipeline)
+scripts/Deploy-Netbox.ps1              deploys or what-ifs main.bicep (pipeline)
+scripts/Get-NetboxImageTag.ps1         content-hash image tag (pipeline)
 ```
 
 ## Prerequisites
@@ -100,51 +103,65 @@ scripts/Get-NetboxImageTag.ps1        content-hash image tag (used by the pipeli
   `Microsoft.DBforPostgreSQL`, `Microsoft.KeyVault`, `Microsoft.OperationalInsights` and
   `Microsoft.ManagedIdentity` registered.
 - An Azure DevOps project with an **Azure Resource Manager service connection** (workload identity
-  federation recommended). Its identity needs:
-  - **Contributor** on the subscription or on the target resource group, to deploy resources.
-  - **Key Vault Secrets Officer** on the target resource group, so the pipeline can generate the secrets.
-    Contributor does not include Key Vault *data* access. Assign this role once, before the first run,
-    as an RBAC administrator (create the resource group first if needed).
-
-  The pipeline identity deliberately has **no** rights to create role assignments. The two role
-  assignments the app needs are made once by an administrator (step 2 below).
+  federation recommended). You set up its permissions in step 1 below.
 - PowerShell 7 and the Azure CLI, to run the one-time scripts locally.
-- Permission to create Entra app registrations (for example Cloud Application Administrator).
+- For the one-time setup: someone who is **Owner** of the subscription or resource group, and someone
+  who is **Privileged Role Administrator** in Entra (to grant the Graph permission). For assigning groups
+  later: **Cloud Application Administrator**.
 
 Set your own values in `pipelines/variables/prod.yml` (`serviceConnection`, `resourceGroupName`,
 `location`) and the banners in `infra/environments/prod.bicepparam`.
 
+### What the pipeline identity may do
+
+The pipeline creates everything, including role assignments and the Entra sign-in app, but its rights are
+kept narrow:
+
+| Permission | Scope | Used for |
+| --- | --- | --- |
+| Contributor | Resource group | Deploying resources |
+| Role Based Access Control Administrator, **with a condition** | Resource group | Assigning only *AcrPull*, *Key Vault Secrets User* and *Key Vault Secrets Officer*, and only to service principals: `id-netbox`, plus the pipeline's own access to the vault. It can't grant Owner, Contributor or any other role, or give anything to users or groups |
+| Microsoft Graph `Application.ReadWrite.OwnedBy` | Tenant | Creating and updating the sign-in app. It only covers apps the pipeline owns |
+
+Two things deliberately stay with people, in `scripts/Set-NetboxLoginAccess.ps1`:
+
+- **Who gets which role.** Assigning groups to app roles from the pipeline would need
+  `AppRoleAssignment.ReadWrite.All`, which can grant any app role in the tenant, including Graph
+  permissions to itself.
+- **The client secret.** Microsoft Graph Bicep can't create application passwords.
+
 ## First deployment
 
-1. **Create the pipeline** in Azure DevOps from `pipelines/azure-pipelines.yml`, create an environment
-   named `netbox-prod`, and run the pipeline. While `entraClientId` is empty, only the *Foundation* and
-   *Build images* stages run.
-
-2. **Grant access (once).** Run this as Owner or Role Based Access Control Administrator on the resource
-   group, for example after PIM elevation. It gives `id-netbox` *AcrPull* and *Key Vault Secrets User*.
-   `-IncludeCurrentUser` also gives you *Key Vault Secrets Officer*, which you need in the next step.
+1. **Set up the pipeline identity (once).** Run this as Owner, for example after PIM elevation, with the
+   service connection's client ID. It creates the resource group if needed and assigns the permissions
+   above. `-GrantGraphPermission` grants the Graph permission, which needs Privileged Role Administrator
+   (or have one run that part). `-IncludeCurrentUser` gives you *Key Vault Secrets Officer* on the
+   resource group, which you need in step 3.
    ```powershell
    az login --tenant <tenant-id>
-   ./scripts/Grant-NetboxAccess.ps1 -SubscriptionId <subscription-id> -ResourceGroupName rg-netbox-prod -IncludeCurrentUser
+   ./scripts/Initialize-PipelineAccess.ps1 -SubscriptionId <subscription-id> -ResourceGroupName rg-netbox-prod `
+       -Location swedencentral -PipelineClientId <service-connection-client-id> -GrantGraphPermission -IncludeCurrentUser
    ```
 
-3. **Create the sign-in app.**
+2. **Create the pipeline** in Azure DevOps from `pipelines/azure-pipelines.yml`, create an environment
+   named `netbox-prod`, and run the pipeline. *Foundation* creates the resources, their role assignments,
+   the secrets and the sign-in app `app-netbox-prod-login`. *What-if* and *Deploy* finish with a warning
+   that the client secret is missing; that's expected on the first run.
+
+3. **Assign the admin group and create the client secret.**
    ```powershell
-   ./scripts/New-NetboxLoginApp.ps1 -ResourceGroupName rg-netbox-prod -AdminGroupObjectId <admin-group-object-id>
+   ./scripts/Set-NetboxLoginAccess.ps1 -ResourceGroupName rg-netbox-prod -AdminGroupObjectId <admin-group-object-id>
    ```
-   This creates `app-netbox-prod-login` with the Container Apps callback URL and the app roles
-   `netbox-admins`, `netbox-editors` and `netbox-readers`. It turns on *assignment required*, gives the group the admin
-   role, and stores a client secret (valid for 1 year) as `entra-client-secret` in Key Vault.
+   This gives the group the admin role and stores a client secret (valid for 1 year) as
+   `entra-client-secret` in Key Vault.
 
-4. **Set the variables** in `pipelines/variables/prod.yml`:
-   - `entraClientId`: the client ID that the script printed.
-   - `initialSuperuserUpn`: your Entra sign-in name. The pipeline creates a local superuser with exactly
-     this username, so your first Entra sign-in lands on an admin account. This user also stays a
-     superuser even if their token has no app roles (break-glass).
+4. **Set `initialSuperuserUpn`** in `pipelines/variables/prod.yml` to your Entra sign-in name. The pipeline
+   creates a local superuser with exactly this username, so your first Entra sign-in lands on an admin
+   account. This user also stays a superuser even if their token has no app roles (break-glass).
 
-5. **Commit and run the pipeline again.** This time *What-if* and *Deploy* run as well. You can add
-   approvals and an exclusive lock on the `netbox-prod` environment. On the first start, NetBox runs all
-   database migrations, which takes a few minutes.
+5. **Commit and run the pipeline again.** This time NetBox is deployed. You can add approvals and an
+   exclusive lock on the `netbox-prod` environment. On the first start, NetBox runs all database
+   migrations, which takes a few minutes.
 
 6. **Open the URL** from the deploy output (`https://ca-netbox.<environment-domain>`, or your
    custom domain once you've added one).
@@ -166,18 +183,14 @@ keeps working alongside them.
    az deployment group show -g rg-netbox-prod -n netbox-foundation --query "properties.outputs.{cname: netboxFqdn.value, txt: customDomainVerificationId.value}"
    ```
 
-2. **Register the sign-in callback** for the host name on the Entra app. Existing redirect URIs are kept.
-   ```powershell
-   ./scripts/New-NetboxLoginApp.ps1 -ResourceGroupName rg-netbox-prod -CustomDomain netbox.contoso.com
-   ```
-
-3. **Add the host name** to `customDomains` in `infra/environments/prod.bicepparam`. Use lower case. The
+2. **Add the host name** to `customDomains` in `infra/environments/prod.bicepparam`. Use lower case. The
    first entry becomes the URL that NetBox prefers.
    ```bicep
    param customDomains = [ 'netbox.contoso.com' ]
    ```
 
-4. **Commit and run the pipeline.** A managed certificate can only be issued after the host name has
+3. **Commit and run the pipeline.** The Foundation stage adds the host name's sign-in callback to the
+   Entra app. A managed certificate can only be issued after the host name has
    been added to the app, so `scripts/Deploy-Netbox.ps1` deploys in two passes. The first pass adds the
    host name unbound and requests the certificate. The script then waits for the certificate to be
    issued (usually a few minutes, at most 20) and runs a second pass that binds it. If issuing fails or
@@ -191,7 +204,7 @@ fails when it adds the host name to the app.
 
 **Removing a custom domain.** Remove it from `customDomains` and run the pipeline. That unbinds the host
 name, but its managed certificate stays in the Container Apps environment. Delete it yourself, then
-remove the DNS records and, optionally, the redirect URI on the Entra app:
+remove the DNS records. The next pipeline run removes the redirect URI from the Entra app:
 
 ```powershell
 az containerapp env certificate list -g rg-netbox-prod -n cae-netbox --managed-certificates-only -o table
@@ -212,9 +225,9 @@ sign in, and the **app role** a group is assigned decides what its members get i
 Assign roles with the script. A group has one role, so assigning a new one replaces the old:
 
 ```powershell
-./scripts/New-NetboxLoginApp.ps1 -ResourceGroupName rg-netbox-prod -AdminGroupObjectId  <admin-group-object-id>
-./scripts/New-NetboxLoginApp.ps1 -ResourceGroupName rg-netbox-prod -EditorGroupObjectId <editor-group-object-id>
-./scripts/New-NetboxLoginApp.ps1 -ResourceGroupName rg-netbox-prod -ReaderGroupObjectId <reader-group-object-id>
+./scripts/Set-NetboxLoginAccess.ps1 -ResourceGroupName rg-netbox-prod -AdminGroupObjectId  <admin-group-object-id>
+./scripts/Set-NetboxLoginAccess.ps1 -ResourceGroupName rg-netbox-prod -EditorGroupObjectId <editor-group-object-id>
+./scripts/Set-NetboxLoginAccess.ps1 -ResourceGroupName rg-netbox-prod -ReaderGroupObjectId <reader-group-object-id>
 ```
 
 How it works:
@@ -229,6 +242,8 @@ How it works:
   what a role gets, edit `ROLE_PERMISSIONS` in the backend rather than in the NetBox UI.
 - **Every change by an editor is recorded** in NetBox's changelog, with the user and the before and after
   values, so mistakes can be traced and reverted by hand.
+- **The roles themselves are defined in `infra/entra.bicep`.** To add a role, add it there (the app role)
+  and in `ROLE_PERMISSIONS` (what it may do in NetBox), then run the pipeline.
 - **Changes take effect at the next sign-in.** Sessions last at most 8 hours (`LOGIN_TIMEOUT`), so a
   role change in Entra applies at the next sign-in. Someone removed from the Entra group is blocked at
   their next Container Apps sign-in.
@@ -244,7 +259,7 @@ How it works:
   With `latest`, upstream releases are **not** picked up until something else changes. Migrations run
   automatically on start.
 - **Rotating the Entra client secret** (yearly):
-  `./scripts/New-NetboxLoginApp.ps1 -ResourceGroupName rg-netbox-prod -RotateSecret`, then restart the
+  `./scripts/Set-NetboxLoginAccess.ps1 -ResourceGroupName rg-netbox-prod -RotateSecret`, then restart the
   revision.
 - **Redis sidecar image** is the official Docker Hub image, pinned in `redisImage` in
   `pipelines/variables/prod.yml`. To upgrade, bump the tag: the pipeline imports the new tag into the
@@ -306,6 +321,8 @@ Ideas for taking this from a showcase to a hardened production setup:
   password. At a minimum, use a dedicated, non-admin database role for the app.
 - **Persistent media** on Azure Files.
 - **PR validation:** run `bicep lint` and PSScriptAnalyzer on pull requests.
+- **No client secret:** use `id-netbox` as a federated credential for the sign-in app instead of a
+  client secret, if Container Apps authentication supports it. That would remove the yearly rotation.
 
 ## License
 

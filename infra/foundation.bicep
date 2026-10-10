@@ -1,9 +1,21 @@
 // Foundation for NetBox: everything that must exist before images can be built
-// and before the application is deployed (registry, Key Vault, identity, Container Apps environment).
+// and before the application is deployed (registry, Key Vault, identity, Container Apps environment),
+// plus the role assignments the app and the pipeline need.
+//
+// The pipeline identity creates the role assignments itself. It holds Role Based Access Control
+// Administrator on the resource group, restricted by a condition to the roles below and to service
+// principals (scripts/Initialize-PipelineAccess.ps1), so it cannot grant anything else.
 
 param serviceName string = 'netbox'
 param location string = resourceGroup().location
 param tags object = {}
+
+@description('Principal type of the identity running this deployment. ServicePrincipal for the pipeline.')
+@allowed([
+  'ServicePrincipal'
+  'User'
+])
+param deployerPrincipalType string = 'ServicePrincipal'
 
 var suffix = uniqueString(resourceGroup().id)
 
@@ -73,12 +85,51 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 }
 
 // Identity used by the container app to pull images and read secrets.
-// User-assigned so its role assignments (scripts/Grant-NetboxAccess.ps1) can exist before the app's first revision starts.
-// The pipeline identity (Contributor-style rights) cannot create role assignments, so they are granted out-of-band.
+// User-assigned so its role assignments (below) can exist before the app's first revision starts.
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'id-${serviceName}'
   location: location
   tags: tags
+}
+
+// Built-in role definition IDs. They are the same in every tenant, and they must match the condition
+// set by scripts/Initialize-PipelineAccess.ps1.
+var roles = {
+  acrPull: '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+  keyVaultSecretsUser: '4633458b-17de-408a-b874-0445c86b69e6'
+  keyVaultSecretsOfficer: 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
+}
+
+// The app pulls images and reads secrets as id-netbox. These exist before the app's first revision starts.
+resource identityAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: containerRegistry
+  name: guid(containerRegistry.id, identity.id, roles.acrPull)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.acrPull)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource identitySecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(keyVault.id, identity.id, roles.keyVaultSecretsUser)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.keyVaultSecretsUser)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// The pipeline generates the secrets (scripts/Initialize-NetboxSecrets.ps1) and reads them to deploy
+resource deployerSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(keyVault.id, deployer().objectId, roles.keyVaultSecretsOfficer)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.keyVaultSecretsOfficer)
+    principalId: deployer().objectId
+    principalType: deployerPrincipalType
+  }
 }
 
 output containerRegistryId string = containerRegistry.id
