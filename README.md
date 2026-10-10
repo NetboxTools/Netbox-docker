@@ -5,6 +5,13 @@ Deploy [NetBox](https://github.com/netbox-community/netbox) (the community
 Apps with Bicep and an Azure DevOps pipeline. Every request is signed in with Entra ID before it reaches
 NetBox, and Entra app roles decide who is an administrator and who can only read.
 
+> [!WARNING]
+> **Work in progress.** This version has been built and checked locally (Bicep builds, script parsing,
+> mock tests), but it hasn't been validated end to end in Azure yet. In particular, the pipeline's
+> delegated role assignments, the Entra app deployment (Microsoft Graph Bicep), Azure Managed Redis mode
+> and custom domains are untested. Try it in a throwaway subscription or resource group first, and
+> expect to adjust things. Issues and fixes are welcome.
+
 - **No secrets in the repository.** The pipeline generates them into Key Vault, and the app reads them
   at runtime through a managed identity.
 - **No NetBox configuration file to maintain.** The upstream image builds its configuration from
