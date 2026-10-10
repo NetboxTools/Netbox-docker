@@ -7,7 +7,5 @@ variables:
   netboxBaseImage: 'docker.io/netboxcommunity/netbox:latest'
   # Official Docker Hub redis image, imported into the registry. Pin an exact tag and bump it deliberately.
   redisImage: 'redis:8.10.2-alpine'
-  # Client ID printed by scripts/New-NetboxLoginApp.ps1. The deploy stages are skipped while empty.
-  entraClientId: ''
   # Entra sign-in name (UPN) of the first NetBox superuser. Must match the case used in Entra.
   initialSuperuserUpn: ''

@@ -26,7 +26,7 @@ stages:
     displayName: 'Foundation'
     jobs:
       - deployment: foundation
-        displayName: 'Registry, Key Vault, identity and Container Apps environment'
+        displayName: 'Registry, Key Vault, identity, environment and sign-in app'
         environment: 'netbox-prod'
         strategy:
           runOnce:
@@ -58,6 +58,16 @@ stages:
                         $ErrorActionPreference = 'Stop'
                         $outputs = az deployment group show -g '$(resourceGroupName)' -n '$(foundationDeploymentName)' --query properties.outputs -o json | ConvertFrom-Json
                         ./scripts/Initialize-NetboxSecrets.ps1 -KeyVaultName $outputs.keyVaultName.value
+                  - task: AzureCLI@2
+                    displayName: 'Deploy Entra sign-in app'
+                    inputs:
+                      azureSubscription: '$(serviceConnection)'
+                      scriptType: 'pscore'
+                      scriptLocation: 'scriptPath'
+                      scriptPath: 'scripts/Deploy-NetboxEntra.ps1'
+                      arguments: >-
+                        -ResourceGroupName '$(resourceGroupName)'
+                        -FoundationDeploymentName '$(foundationDeploymentName)'
 
   - stage: build
     displayName: 'Build images'
@@ -107,54 +117,51 @@ stages:
                     az acr import --name $registry --source 'docker.io/library/$(redisImage)' --image '$(redisImage)'
                 }
 
-  - ${{ if ne(variables.entraClientId, '') }}:
-      - stage: whatif
-        displayName: 'What-if'
-        dependsOn: build
-        jobs:
-          - job: whatif
-            displayName: 'What-if NetBox'
-            steps:
-              - checkout: self
-              - task: AzureCLI@2
-                displayName: 'What-if'
-                inputs:
-                  azureSubscription: '$(serviceConnection)'
-                  scriptType: 'pscore'
-                  scriptLocation: 'scriptPath'
-                  scriptPath: 'scripts/Deploy-Netbox.ps1'
-                  arguments: >-
-                    -ResourceGroupName '$(resourceGroupName)'
-                    -FoundationDeploymentName '$(foundationDeploymentName)'
-                    -BaseImage '$(netboxBaseImage)'
-                    -RedisImage '$(redisImage)'
-                    -EntraClientId '$(entraClientId)'
-                    -InitialSuperuserUpn '$(initialSuperuserUpn)'
-                    -WhatIf
+  - stage: whatif
+    displayName: 'What-if'
+    dependsOn: build
+    jobs:
+      - job: whatif
+        displayName: 'What-if NetBox'
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: 'What-if'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'pscore'
+              scriptLocation: 'scriptPath'
+              scriptPath: 'scripts/Deploy-Netbox.ps1'
+              arguments: >-
+                -ResourceGroupName '$(resourceGroupName)'
+                -FoundationDeploymentName '$(foundationDeploymentName)'
+                -BaseImage '$(netboxBaseImage)'
+                -RedisImage '$(redisImage)'
+                -InitialSuperuserUpn '$(initialSuperuserUpn)'
+                -WhatIf
 
-      - stage: deploy
-        displayName: 'Deploy'
-        dependsOn: whatif
-        jobs:
-          - deployment: netbox
-            displayName: 'Deploy NetBox'
-            environment: 'netbox-prod'
-            strategy:
-              runOnce:
-                deploy:
-                  steps:
-                    - checkout: self
-                    - task: AzureCLI@2
-                      displayName: 'Deploy'
-                      inputs:
-                        azureSubscription: '$(serviceConnection)'
-                        scriptType: 'pscore'
-                        scriptLocation: 'scriptPath'
-                        scriptPath: 'scripts/Deploy-Netbox.ps1'
-                        arguments: >-
-                          -ResourceGroupName '$(resourceGroupName)'
-                          -FoundationDeploymentName '$(foundationDeploymentName)'
-                          -BaseImage '$(netboxBaseImage)'
-                          -RedisImage '$(redisImage)'
-                          -EntraClientId '$(entraClientId)'
-                          -InitialSuperuserUpn '$(initialSuperuserUpn)'
+  - stage: deploy
+    displayName: 'Deploy'
+    dependsOn: whatif
+    jobs:
+      - deployment: netbox
+        displayName: 'Deploy NetBox'
+        environment: 'netbox-prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: 'Deploy'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'pscore'
+                    scriptLocation: 'scriptPath'
+                    scriptPath: 'scripts/Deploy-Netbox.ps1'
+                    arguments: >-
+                      -ResourceGroupName '$(resourceGroupName)'
+                      -FoundationDeploymentName '$(foundationDeploymentName)'
+                      -BaseImage '$(netboxBaseImage)'
+                      -RedisImage '$(redisImage)'
+                      -InitialSuperuserUpn '$(initialSuperuserUpn)'
